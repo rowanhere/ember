@@ -5,7 +5,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -15,6 +15,7 @@ use tiny_keccak::{Hasher, Keccak};
 const DEFAULT_NODE: &str = "https://emberchain.org";
 const DEFAULT_BATCH_SIZE: u64 = 25_000;
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
+static DASHBOARD_RENDER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Header {
@@ -236,6 +237,7 @@ fn main() {
         }
     }
 
+    print!("\x1b[?25h\n");
     println!(
         "[STOP] checked={} found={} accepted={} stale={} avg={}",
         format_hashes(total_hashes.load(Ordering::Relaxed) as f64),
@@ -509,65 +511,73 @@ fn sleep_or_stop(stop: &AtomicBool, duration: Duration) {
 }
 
 fn render_dashboard(dashboard: &Dashboard) {
-    print!("\x1b[2J\x1b[H");
-    println!("EMBER CPU MINER - DASHBOARD");
-    println!("======================================================================");
-    println!(
+    if DASHBOARD_RENDER_COUNT.fetch_add(1, Ordering::Relaxed) == 0 {
+        print!("\x1b[2J");
+    }
+    print!("\x1b[?25l\x1b[H");
+    dashboard_line("EMBER CPU MINER - DASHBOARD");
+    dashboard_line("======================================================================");
+    dashboard_line(&format!(
         "{:<18} {:<18} {:<18} {:<18}",
         "Algo", "Threads", "Miner", "Node"
-    );
-    println!(
+    ));
+    dashboard_line(&format!(
         "{:<18} {:<18} {:<18} {:<18}",
         "Keccak-256",
         dashboard.threads,
         dashboard.miner,
         truncate_for_table(dashboard.node, 18)
-    );
-    println!("----------------------------------------------------------------------");
-    println!(
+    ));
+    dashboard_line("----------------------------------------------------------------------");
+    dashboard_line(&format!(
         "{:<14} {:<18} {:<18} {:<18}",
         "Block", "Difficulty", "HashRate", "Average"
-    );
-    println!(
+    ));
+    dashboard_line(&format!(
         "{:<14} {:<18} {:<18} {:<18}",
         dashboard.block,
         truncate_for_table(dashboard.difficulty, 18),
         format_rate(dashboard.current_rate),
         format_rate(dashboard.average_rate)
-    );
-    println!("----------------------------------------------------------------------");
-    println!(
+    ));
+    dashboard_line("----------------------------------------------------------------------");
+    dashboard_line(&format!(
         "{:<16} {:<12} {:<22} {:<12}",
         "Checked", "Uptime", "Nonce", "Block Found"
-    );
-    println!(
+    ));
+    dashboard_line(&format!(
         "{:<16} {:<12} {:<22} {:<12}",
         format_hashes(dashboard.checked as f64),
         format_duration(dashboard.uptime),
         dashboard.current_nonce,
         dashboard.blocks_found
-    );
-    println!("----------------------------------------------------------------------");
-    println!(
+    ));
+    dashboard_line("----------------------------------------------------------------------");
+    dashboard_line(&format!(
         "Accepted Blocks: {} | Stale Blocks: {}",
         dashboard.accepted, dashboard.stale
-    );
-    println!("{:<10} {:<22} {:<28}", "Block", "Nonce", "Status");
+    ));
+    dashboard_line(&format!("{:<10} {:<22} {:<28}", "Block", "Nonce", "Status"));
     if dashboard.recent_blocks.is_empty() {
-        println!("{:<10} {:<22} {:<28}", "-", "-", "none yet");
+        dashboard_line(&format!("{:<10} {:<22} {:<28}", "-", "-", "none yet"));
     } else {
         for block in dashboard.recent_blocks.iter().take(8) {
-            println!(
+            dashboard_line(&format!(
                 "{:<10} {:<22} {:<28}",
                 block.block,
                 block.nonce,
                 truncate_for_table(&block.status, 28)
-            );
+            ));
         }
     }
-    println!("======================================================================");
-    println!("Ctrl+C to stop. Dashboard refreshes in-place every 5 seconds.");
+    dashboard_line("======================================================================");
+    dashboard_line("Ctrl+C to stop. Dashboard refreshes silently every 5 seconds.");
+    print!("\x1b[J");
     let _ = io::stdout().flush();
+}
+
+fn dashboard_line(line: &str) {
+    print!("\x1b[2K{line}\r\n");
 }
 
 fn push_found_block(blocks: &mut Vec<FoundBlock>, block: FoundBlock) {
