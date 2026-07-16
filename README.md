@@ -1,6 +1,6 @@
 # Ember CPU Miner
 
-Standalone CPU miner for the browser mining API at `emberchain.org`.
+Standalone CPU/CUDA miner for the browser mining API at `emberchain.org`.
 
 It mirrors the live Web Worker:
 
@@ -21,10 +21,28 @@ cd ember-cpu-miner
 cargo build --release
 ```
 
+CUDA build for an RTX 4090:
+
+```bash
+CUDA_ARCH=sm_89 cargo build --release --features cuda
+```
+
 ## Run
 
 ```bash
 ./target/release/ember-cpu-miner -j "$(nproc)" 0xe0124ead86bdc20cc675317bef95533020a6165f
+```
+
+Run on an RTX 4090:
+
+```bash
+./run-vps.sh --cuda
+```
+
+Manual CUDA run:
+
+```bash
+./target/release/ember-cpu-miner --cuda --cuda-device 0 0xe0124ead86bdc20cc675317bef95533020a6165f
 ```
 
 Options:

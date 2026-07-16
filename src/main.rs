@@ -12,8 +12,24 @@ use tiny_keccak::{Hasher, Keccak};
 
 const DEFAULT_NODE: &str = "https://emberchain.org";
 const DEFAULT_BATCH_SIZE: u64 = 25_000;
+const DEFAULT_CUDA_BATCH_SIZE: u64 = 67_108_864;
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 static DASHBOARD_RENDER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn ember_cuda_mine(
+        prefix: *const u8,
+        prefix_len: usize,
+        target: *const u8,
+        start_nonce: u64,
+        total_nonces: u64,
+        found_nonce: *mut u64,
+        found_hash: *mut u8,
+        checked: *mut u64,
+        device_id: i32,
+    ) -> i32;
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Header {
@@ -53,6 +69,9 @@ struct Config {
     node: String,
     threads: usize,
     batch_size: u64,
+    cuda: bool,
+    cuda_device: i32,
+    cuda_batch_size: u64,
     no_submit: bool,
 }
 
@@ -110,6 +129,14 @@ struct Dashboard<'a> {
 
 fn main() {
     let config = parse_args();
+
+    #[cfg(not(feature = "cuda"))]
+    if config.cuda {
+        eprintln!("[ERROR] CUDA requested, but this binary was built without --features cuda.");
+        eprintln!("[ERROR] Build with: cargo build --release --features cuda");
+        std::process::exit(2);
+    }
+
     let client = Client::builder()
         .timeout(Duration::from_secs(20))
         .user_agent("ember-cpu-miner/0.1")
@@ -125,8 +152,16 @@ fn main() {
 
     println!("[CONFIG] node: {}", config.node);
     println!("[CONFIG] miner: {}", config.miner);
+    println!(
+        "[CONFIG] mode: {}",
+        if config.cuda { "CUDA" } else { "CPU" }
+    );
     println!("[CONFIG] threads: {}", config.threads);
     println!("[CONFIG] batch size/thread: {}", config.batch_size);
+    if config.cuda {
+        println!("[CONFIG] cuda device: {}", config.cuda_device);
+        println!("[CONFIG] cuda batch size: {}", config.cuda_batch_size);
+    }
     print_banner(&config);
 
     let started = Instant::now();
@@ -261,6 +296,9 @@ fn parse_args() -> Config {
     let mut node = DEFAULT_NODE.to_string();
     let mut threads = num_cpus::get().max(1);
     let mut batch_size = DEFAULT_BATCH_SIZE;
+    let mut cuda = false;
+    let mut cuda_device = 0i32;
+    let mut cuda_batch_size = DEFAULT_CUDA_BATCH_SIZE;
     let mut no_submit = false;
 
     while let Some(arg) = args.next() {
@@ -280,6 +318,15 @@ fn parse_args() -> Config {
             "--batch-size" => {
                 let value = args.next().unwrap_or_else(|| usage());
                 batch_size = value.parse::<u64>().unwrap_or_else(|_| usage()).max(1);
+            }
+            "--cuda" => cuda = true,
+            "--cuda-device" => {
+                let value = args.next().unwrap_or_else(|| usage());
+                cuda_device = value.parse::<i32>().unwrap_or_else(|_| usage());
+            }
+            "--cuda-batch-size" => {
+                let value = args.next().unwrap_or_else(|| usage());
+                cuda_batch_size = value.parse::<u64>().unwrap_or_else(|_| usage()).max(1);
             }
             "--no-submit" => no_submit = true,
             value if value.starts_with('-') => usage(),
@@ -303,13 +350,16 @@ fn parse_args() -> Config {
         node,
         threads,
         batch_size,
+        cuda,
+        cuda_device,
+        cuda_batch_size,
         no_submit,
     }
 }
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: ember-cpu-miner [--node https://emberchain.org] [-j THREADS] [--batch-size N] [--no-submit] MINER_ADDRESS"
+        "Usage: ember-cpu-miner [--cuda] [--cuda-device ID] [--cuda-batch-size N] [--node https://emberchain.org] [-j THREADS] [--batch-size N] [--no-submit] MINER_ADDRESS"
     );
     std::process::exit(2);
 }
@@ -364,6 +414,10 @@ fn mine_template(
     stop: &Arc<AtomicBool>,
     view: &MineView,
 ) -> Option<Found> {
+    if config.cuda {
+        return mine_template_cuda(config, template, target, total_hashes, stop, view);
+    }
+
     let found_flag = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let mut handles = Vec::with_capacity(config.threads);
@@ -462,6 +516,109 @@ fn mine_template(
     }
 
     found
+}
+
+#[cfg(feature = "cuda")]
+fn mine_template_cuda(
+    config: &Config,
+    template: &Template,
+    target: [u8; 32],
+    total_hashes: &Arc<AtomicU64>,
+    stop: &Arc<AtomicBool>,
+    view: &MineView,
+) -> Option<Found> {
+    let work_prefix = WorkPrefix::new(&template.header);
+    let mut rng = rand::thread_rng();
+    let mut start_nonce = rng.gen::<u64>();
+    let miner = abbreviate(&config.miner, 12, 8);
+    let node = config.node.clone();
+    let mut last_dashboard = Instant::now()
+        .checked_sub(STATUS_INTERVAL)
+        .unwrap_or_else(Instant::now);
+
+    while !stop.load(Ordering::Relaxed) {
+        let mut found_nonce = 0u64;
+        let mut found_hash = [0u8; 32];
+        let mut checked = 0u64;
+        let batch_started = Instant::now();
+
+        let status = unsafe {
+            ember_cuda_mine(
+                work_prefix.prefix.as_ptr(),
+                work_prefix.prefix.len(),
+                target.as_ptr(),
+                start_nonce,
+                config.cuda_batch_size,
+                &mut found_nonce,
+                found_hash.as_mut_ptr(),
+                &mut checked,
+                config.cuda_device,
+            )
+        };
+
+        if status < 0 {
+            eprintln!("[CUDA] kernel failed with status {status}");
+            sleep_or_stop(stop, Duration::from_secs(2));
+            return None;
+        }
+
+        total_hashes.fetch_add(checked, Ordering::Relaxed);
+
+        if last_dashboard.elapsed() >= STATUS_INTERVAL || status == 1 {
+            last_dashboard = Instant::now();
+            let all_checked = total_hashes.load(Ordering::Relaxed);
+            let block_checked = all_checked.saturating_sub(view.block_hashes_before);
+            let current_rate =
+                block_checked as f64 / view.block_started.elapsed().as_secs_f64().max(0.001);
+            let average_rate =
+                all_checked as f64 / view.miner_started.elapsed().as_secs_f64().max(0.001);
+            render_dashboard(&Dashboard {
+                miner: &miner,
+                node: &node,
+                threads: 1,
+                block: template.header.number,
+                difficulty: &template.header.difficulty,
+                current_rate,
+                average_rate,
+                checked: all_checked,
+                uptime: view.miner_started.elapsed(),
+                current_nonce: start_nonce,
+                blocks_found: view.blocks_found,
+                accepted: view.accepted,
+                stale: view.stale,
+                recent_blocks: &view.recent_blocks,
+            });
+        }
+
+        if status == 1 {
+            return Some(Found {
+                nonce: found_nonce,
+                block_hash: format_hash_hex(&found_hash),
+            });
+        }
+
+        let elapsed = batch_started.elapsed().as_secs_f64().max(0.001);
+        let rate = checked as f64 / elapsed;
+        if rate < 1_000.0 {
+            eprintln!("[CUDA] very low GPU rate detected: {}", format_rate(rate));
+        }
+
+        start_nonce = start_nonce.wrapping_add(checked);
+    }
+
+    None
+}
+
+#[cfg(not(feature = "cuda"))]
+fn mine_template_cuda(
+    _config: &Config,
+    _template: &Template,
+    _target: [u8; 32],
+    _total_hashes: &Arc<AtomicU64>,
+    _stop: &Arc<AtomicBool>,
+    _view: &MineView,
+) -> Option<Found> {
+    None
 }
 
 fn block_hash_bytes(work: &WorkPrefix, nonce: u64) -> [u8; 32] {
