@@ -61,6 +61,12 @@ struct Found {
     block_hash: String,
 }
 
+#[derive(Debug)]
+enum SubmitError {
+    Stale(String),
+    Failed(String),
+}
+
 fn main() {
     let config = parse_args();
     let client = Client::builder()
@@ -142,7 +148,10 @@ fn main() {
                             accepted += 1;
                             println!("[SUBMIT] accepted={} response={}", accepted, body);
                         }
-                        Err(err) => eprintln!("[WARN] submit failed: {err}"),
+                        Err(SubmitError::Stale(body)) => {
+                            println!("[STALE] node already advanced before submit: {body}");
+                        }
+                        Err(SubmitError::Failed(err)) => eprintln!("[WARN] submit failed: {err}"),
                     }
                 }
             }
@@ -345,7 +354,7 @@ fn submit_block(
     config: &Config,
     template: &Template,
     found: &Found,
-) -> Result<String, String> {
+) -> Result<String, SubmitError> {
     let payload = SubmitBlock {
         miner_address: &config.miner,
         header: &template.header,
@@ -355,15 +364,26 @@ fn submit_block(
     };
     let url = format!("{}/api/mining/submit", config.node);
 
-    client
+    let response = client
         .post(url)
         .json(&payload)
         .send()
-        .map_err(|err| err.to_string())?
-        .error_for_status()
-        .map_err(|err| err.to_string())?
+        .map_err(|err| SubmitError::Failed(err.to_string()))?;
+
+    let status = response.status();
+    let body = response
         .text()
-        .map_err(|err| err.to_string())
+        .map_err(|err| SubmitError::Failed(err.to_string()))?;
+
+    if status.is_success() {
+        return Ok(body);
+    }
+
+    if status.as_u16() == 409 {
+        return Err(SubmitError::Stale(body));
+    }
+
+    Err(SubmitError::Failed(format!("HTTP {status}: {body}")))
 }
 
 fn sleep_or_stop(stop: &AtomicBool, duration: Duration) {
