@@ -1,5 +1,3 @@
-use num_bigint::BigUint;
-use num_traits::Zero;
 use rand::Rng;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -69,6 +67,12 @@ struct FoundBlock {
     block: u64,
     nonce: u64,
     status: String,
+}
+
+#[derive(Clone)]
+struct WorkPrefix {
+    prefix: Vec<u8>,
+    suffix: &'static [u8],
 }
 
 #[derive(Debug)]
@@ -142,7 +146,7 @@ fn main() {
             }
         };
 
-        let target = match parse_target(&template.target) {
+        let target = match parse_target_bytes(&template.target) {
             Ok(target) => target,
             Err(err) => {
                 eprintln!("[WARN] bad target from node: {err}");
@@ -325,16 +329,37 @@ fn fetch_template(client: &Client, config: &Config) -> Result<Template, String> 
         .map_err(|err| err.to_string())
 }
 
-fn parse_target(target: &str) -> Result<BigUint, String> {
-    BigUint::parse_bytes(target.as_bytes(), 10)
-        .filter(|value| !value.is_zero())
-        .ok_or_else(|| format!("invalid decimal target: {target}"))
+fn parse_target_bytes(target: &str) -> Result<[u8; 32], String> {
+    let mut value = [0u8; 32];
+    for byte in target.bytes() {
+        if !byte.is_ascii_digit() {
+            return Err(format!("invalid decimal target: {target}"));
+        }
+
+        let digit = byte - b'0';
+        let mut carry = digit as u16;
+        for slot in value.iter_mut().rev() {
+            let next = (*slot as u16) * 10 + carry;
+            *slot = (next & 0xff) as u8;
+            carry = next >> 8;
+        }
+
+        if carry != 0 {
+            return Err(format!("target does not fit in 256 bits: {target}"));
+        }
+    }
+
+    if value.iter().all(|&byte| byte == 0) {
+        return Err(format!("invalid decimal target: {target}"));
+    }
+
+    Ok(value)
 }
 
 fn mine_template(
     config: &Config,
     template: &Template,
-    target: BigUint,
+    target: [u8; 32],
     total_hashes: &Arc<AtomicU64>,
     stop: &Arc<AtomicBool>,
     view: &MineView,
@@ -342,10 +367,10 @@ fn mine_template(
     let found_flag = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let mut handles = Vec::with_capacity(config.threads);
+    let work_prefix = WorkPrefix::new(&template.header);
 
     for worker_id in 0..config.threads {
-        let header = template.header.clone();
-        let target = target.clone();
+        let work_prefix = work_prefix.clone();
         let tx = tx.clone();
         let total_hashes = Arc::clone(total_hashes);
         let stop = Arc::clone(stop);
@@ -375,14 +400,14 @@ fn mine_template(
 
             while !stop.load(Ordering::Relaxed) && !found_flag.load(Ordering::Relaxed) {
                 for _ in 0..batch_size {
-                    let (hash_hex, hash_value) = block_hash(&header, nonce);
+                    let hash = block_hash_bytes(&work_prefix, nonce);
                     local_hashes = local_hashes.wrapping_add(1);
 
-                    if hash_value <= target {
+                    if hash_meets_target(&hash, &target) {
                         if !found_flag.swap(true, Ordering::Relaxed) {
                             let _ = tx.send(Found {
                                 nonce,
-                                block_hash: hash_hex,
+                                block_hash: format_hash_hex(&hash),
                             });
                         }
                         total_hashes.fetch_add(local_hashes, Ordering::Relaxed);
@@ -439,31 +464,42 @@ fn mine_template(
     found
 }
 
-fn block_hash(header: &Header, nonce: u64) -> (String, BigUint) {
-    let bytes = browser_header_json(header, nonce);
+fn block_hash_bytes(work: &WorkPrefix, nonce: u64) -> [u8; 32] {
     let mut output = [0u8; 32];
     let mut keccak = Keccak::v256();
-    keccak.update(bytes.as_bytes());
+    keccak.update(&work.prefix);
+    keccak.update(nonce.to_string().as_bytes());
+    keccak.update(work.suffix);
     keccak.finalize(&mut output);
-
-    (
-        format!("0x{}", hex::encode(output)),
-        BigUint::from_bytes_be(&output),
-    )
+    output
 }
 
-fn browser_header_json(header: &Header, nonce: u64) -> String {
-    // Matches the worker's JSON.stringify field order exactly.
-    format!(
-        "{{\"number\":{},\"parentHash\":\"{}\",\"timestamp\":{},\"miner\":\"{}\",\"difficulty\":\"{}\",\"transactionsRoot\":\"{}\",\"nonce\":\"{}\"}}",
-        header.number,
-        header.parent_hash,
-        header.timestamp,
-        header.miner,
-        header.difficulty,
-        header.transactions_root,
-        nonce
-    )
+fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
+    hash <= target
+}
+
+fn format_hash_hex(hash: &[u8; 32]) -> String {
+    format!("0x{}", hex::encode(hash))
+}
+
+impl WorkPrefix {
+    fn new(header: &Header) -> Self {
+        let prefix = format!(
+            "{{\"number\":{},\"parentHash\":\"{}\",\"timestamp\":{},\"miner\":\"{}\",\"difficulty\":\"{}\",\"transactionsRoot\":\"{}\",\"nonce\":\"",
+            header.number,
+            header.parent_hash,
+            header.timestamp,
+            header.miner,
+            header.difficulty,
+            header.transactions_root
+        )
+        .into_bytes();
+
+        Self {
+            prefix,
+            suffix: b"\"}",
+        }
+    }
 }
 
 fn submit_block(
