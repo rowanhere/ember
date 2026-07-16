@@ -13,6 +13,7 @@ __constant__ uint8_t C_PREFIX[MAX_PREFIX_LEN];
 __constant__ uint8_t C_TARGET[32];
 
 static __device__ __forceinline__ uint64_t rotl64(uint64_t x, int n) {
+    if (n == 0) return x;
     return (x << n) | (x >> (64 - n));
 }
 

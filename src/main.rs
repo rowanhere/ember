@@ -528,6 +528,12 @@ fn mine_template_cuda(
     view: &MineView,
 ) -> Option<Found> {
     let work_prefix = WorkPrefix::new(&template.header);
+    if let Err(err) = cuda_self_test(config, &work_prefix) {
+        eprintln!("[CUDA] self-test failed: {err}");
+        eprintln!("[CUDA] refusing to mine on GPU until the CUDA hash matches CPU/browser hash");
+        return None;
+    }
+
     let mut rng = rand::thread_rng();
     let mut start_nonce = rng.gen::<u64>();
     let miner = abbreviate(&config.miner, 12, 8);
@@ -607,6 +613,46 @@ fn mine_template_cuda(
     }
 
     None
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_self_test(config: &Config, work_prefix: &WorkPrefix) -> Result<(), String> {
+    let test_nonce = 123_456_789u64;
+    let pass_target = [0xffu8; 32];
+    let expected_hash = block_hash_bytes(work_prefix, test_nonce);
+    let mut found_nonce = 0u64;
+    let mut found_hash = [0u8; 32];
+    let mut checked = 0u64;
+
+    let status = unsafe {
+        ember_cuda_mine(
+            work_prefix.prefix.as_ptr(),
+            work_prefix.prefix.len(),
+            pass_target.as_ptr(),
+            test_nonce,
+            1,
+            &mut found_nonce,
+            found_hash.as_mut_ptr(),
+            &mut checked,
+            config.cuda_device,
+        )
+    };
+
+    if status != 1 {
+        return Err(format!("expected status 1, got {status}"));
+    }
+    if found_nonce != test_nonce {
+        return Err(format!("expected nonce {test_nonce}, got {found_nonce}"));
+    }
+    if found_hash != expected_hash {
+        return Err(format!(
+            "hash mismatch gpu={} cpu={}",
+            format_hash_hex(&found_hash),
+            format_hash_hex(&expected_hash)
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(not(feature = "cuda"))]
