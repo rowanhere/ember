@@ -4,6 +4,7 @@ use rand::Rng;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -62,6 +63,13 @@ struct Found {
     block_hash: String,
 }
 
+#[derive(Clone, Debug)]
+struct FoundBlock {
+    block: u64,
+    nonce: u64,
+    status: String,
+}
+
 #[derive(Debug)]
 enum SubmitError {
     Stale(String),
@@ -72,8 +80,27 @@ struct MineView {
     miner_started: Instant,
     block_started: Instant,
     block_hashes_before: u64,
+    blocks_found: u64,
     accepted: u64,
     stale: u64,
+    recent_blocks: Vec<FoundBlock>,
+}
+
+struct Dashboard<'a> {
+    miner: &'a str,
+    node: &'a str,
+    threads: usize,
+    block: u64,
+    difficulty: &'a str,
+    current_rate: f64,
+    average_rate: f64,
+    checked: u64,
+    uptime: Duration,
+    current_nonce: u64,
+    blocks_found: u64,
+    accepted: u64,
+    stale: u64,
+    recent_blocks: &'a [FoundBlock],
 }
 
 fn main() {
@@ -101,6 +128,8 @@ fn main() {
     let total_hashes = Arc::new(AtomicU64::new(0));
     let mut accepted = 0u64;
     let mut stale = 0u64;
+    let mut blocks_found = 0u64;
+    let mut recent_blocks = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
         let template = match fetch_template(&client, &config) {
@@ -135,8 +164,10 @@ fn main() {
                 miner_started: started,
                 block_started,
                 block_hashes_before,
+                blocks_found,
                 accepted,
                 stale,
+                recent_blocks: recent_blocks.clone(),
             },
         );
         let block_hashes = total_hashes
@@ -159,15 +190,42 @@ fn main() {
 
                 if config.no_submit {
                     println!("[SUBMIT] skipped because --no-submit is set");
+                    blocks_found += 1;
+                    push_found_block(
+                        &mut recent_blocks,
+                        FoundBlock {
+                            block: template.header.number,
+                            nonce: found.nonce,
+                            status: "dry-run".to_string(),
+                        },
+                    );
                     break;
                 } else {
                     match submit_block(&client, &config, &template, &found) {
                         Ok(body) => {
+                            blocks_found += 1;
                             accepted += 1;
+                            push_found_block(
+                                &mut recent_blocks,
+                                FoundBlock {
+                                    block: template.header.number,
+                                    nonce: found.nonce,
+                                    status: compact_status(&body),
+                                },
+                            );
                             println!("[SUBMIT] accepted={} response={}", accepted, body);
                         }
                         Err(SubmitError::Stale(body)) => {
+                            blocks_found += 1;
                             stale += 1;
+                            push_found_block(
+                                &mut recent_blocks,
+                                FoundBlock {
+                                    block: template.header.number,
+                                    nonce: found.nonce,
+                                    status: format!("stale: {}", compact_status(&body)),
+                                },
+                            );
                             println!("[STALE] node already advanced before submit: {body}");
                         }
                         Err(SubmitError::Failed(err)) => eprintln!("[WARN] submit failed: {err}"),
@@ -179,8 +237,9 @@ fn main() {
     }
 
     println!(
-        "[STOP] checked={} accepted={} stale={} avg={}",
+        "[STOP] checked={} found={} accepted={} stale={} avg={}",
         format_hashes(total_hashes.load(Ordering::Relaxed) as f64),
+        blocks_found,
         accepted,
         stale,
         format_rate(
@@ -296,13 +355,20 @@ fn mine_template(
         let block_hashes_before = view.block_hashes_before;
         let accepted = view.accepted;
         let stale = view.stale;
+        let blocks_found = view.blocks_found;
+        let recent_blocks = view.recent_blocks.clone();
         let block_number = template.header.number;
         let difficulty = template.header.difficulty.clone();
+        let miner = abbreviate(&config.miner, 12, 8);
+        let node = config.node.clone();
+        let worker_count = config.threads;
 
         handles.push(thread::spawn(move || {
             let mut rng = rand::thread_rng();
             let mut nonce = rng.gen::<u64>().wrapping_add(worker_id as u64);
-            let mut last_log = Instant::now();
+            let mut last_log = Instant::now()
+                .checked_sub(STATUS_INTERVAL)
+                .unwrap_or_else(Instant::now);
             let mut local_hashes = 0u64;
 
             while !stop.load(Ordering::Relaxed) && !found_flag.load(Ordering::Relaxed) {
@@ -335,18 +401,22 @@ fn mine_template(
                         block_checked as f64 / block_started.elapsed().as_secs_f64().max(0.001);
                     let average_rate =
                         checked as f64 / miner_started.elapsed().as_secs_f64().max(0.001);
-                    println!(
-                        "[STATS] block #{:<7} diff {:<9} speed {:>11} avg {:>11} total {:>10} acc {:<3} stale {:<3} uptime {} nonce~{}",
-                        block_number,
-                        difficulty,
-                        format_rate(current_rate),
-                        format_rate(average_rate),
-                        format_hashes(checked as f64),
+                    render_dashboard(&Dashboard {
+                        miner: &miner,
+                        node: &node,
+                        threads: worker_count,
+                        block: block_number,
+                        difficulty: &difficulty,
+                        current_rate,
+                        average_rate,
+                        checked,
+                        uptime: miner_started.elapsed(),
+                        current_nonce: nonce,
+                        blocks_found,
                         accepted,
                         stale,
-                        format_duration(miner_started.elapsed()),
-                        nonce,
-                    );
+                        recent_blocks: &recent_blocks,
+                    });
                 }
             }
 
@@ -438,6 +508,73 @@ fn sleep_or_stop(stop: &AtomicBool, duration: Duration) {
     }
 }
 
+fn render_dashboard(dashboard: &Dashboard) {
+    print!("\x1b[2J\x1b[H");
+    println!("EMBER CPU MINER - DASHBOARD");
+    println!("======================================================================");
+    println!(
+        "{:<18} {:<18} {:<18} {:<18}",
+        "Algo", "Threads", "Miner", "Node"
+    );
+    println!(
+        "{:<18} {:<18} {:<18} {:<18}",
+        "Keccak-256",
+        dashboard.threads,
+        dashboard.miner,
+        truncate_for_table(dashboard.node, 18)
+    );
+    println!("----------------------------------------------------------------------");
+    println!(
+        "{:<14} {:<18} {:<18} {:<18}",
+        "Block", "Difficulty", "HashRate", "Average"
+    );
+    println!(
+        "{:<14} {:<18} {:<18} {:<18}",
+        dashboard.block,
+        truncate_for_table(dashboard.difficulty, 18),
+        format_rate(dashboard.current_rate),
+        format_rate(dashboard.average_rate)
+    );
+    println!("----------------------------------------------------------------------");
+    println!(
+        "{:<16} {:<12} {:<22} {:<12}",
+        "Checked", "Uptime", "Nonce", "Block Found"
+    );
+    println!(
+        "{:<16} {:<12} {:<22} {:<12}",
+        format_hashes(dashboard.checked as f64),
+        format_duration(dashboard.uptime),
+        dashboard.current_nonce,
+        dashboard.blocks_found
+    );
+    println!("----------------------------------------------------------------------");
+    println!(
+        "Accepted Blocks: {} | Stale Blocks: {}",
+        dashboard.accepted, dashboard.stale
+    );
+    println!("{:<10} {:<22} {:<28}", "Block", "Nonce", "Status");
+    if dashboard.recent_blocks.is_empty() {
+        println!("{:<10} {:<22} {:<28}", "-", "-", "none yet");
+    } else {
+        for block in dashboard.recent_blocks.iter().take(8) {
+            println!(
+                "{:<10} {:<22} {:<28}",
+                block.block,
+                block.nonce,
+                truncate_for_table(&block.status, 28)
+            );
+        }
+    }
+    println!("======================================================================");
+    println!("Ctrl+C to stop. Dashboard refreshes in-place every 5 seconds.");
+    let _ = io::stdout().flush();
+}
+
+fn push_found_block(blocks: &mut Vec<FoundBlock>, block: FoundBlock) {
+    blocks.insert(0, block);
+    blocks.truncate(8);
+}
+
 fn print_banner(config: &Config) {
     println!("+------------------------------------------------------------+");
     println!("| Ember CPU Miner                                            |");
@@ -500,4 +637,18 @@ fn abbreviate(value: &str, head: usize, tail: usize) -> String {
     }
 
     format!("{}...{}", &value[..head], &value[value.len() - tail..])
+}
+
+fn compact_status(status: &str) -> String {
+    status.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+fn truncate_for_table(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        value.to_string()
+    } else if max_len <= 3 {
+        value[..max_len].to_string()
+    } else {
+        format!("{}...", &value[..max_len - 3])
+    }
 }

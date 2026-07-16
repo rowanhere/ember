@@ -39,10 +39,16 @@ Dry-run without submitting found blocks:
 ./target/release/ember-cpu-miner --no-submit -j 2 --batch-size 1000 0xe0124ead86bdc20cc675317bef95533020a6165f
 ```
 
-The miner prints scaled dashboard-style stats:
+The miner prints an in-place dashboard:
 
 ```text
-[STATS] block #3965    diff 27164054  speed  449.0 KH/s avg  389.4 KH/s total    2.25 MH acc 0   stale 0   uptime 00:00:05 nonce~10691912333090672223
+EMBER CPU MINER - DASHBOARD
+======================================================================
+Block          Difficulty         HashRate           Average
+4002           32416993            450.6 KH/s          2.94 KH/s
+----------------------------------------------------------------------
+Checked          Uptime       Nonce                  Block Found
+  2.00 KH        00:00:00     6726689996527822293    0
 ```
 
 Keep it running after SSH disconnects:
