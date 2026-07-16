@@ -13,6 +13,7 @@ use tiny_keccak::{Hasher, Keccak};
 
 const DEFAULT_NODE: &str = "https://emberchain.org";
 const DEFAULT_BATCH_SIZE: u64 = 25_000;
+const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Header {
@@ -67,6 +68,14 @@ enum SubmitError {
     Failed(String),
 }
 
+struct MineView {
+    miner_started: Instant,
+    block_started: Instant,
+    block_hashes_before: u64,
+    accepted: u64,
+    stale: u64,
+}
+
 fn main() {
     let config = parse_args();
     let client = Client::builder()
@@ -86,10 +95,12 @@ fn main() {
     println!("[CONFIG] miner: {}", config.miner);
     println!("[CONFIG] threads: {}", config.threads);
     println!("[CONFIG] batch size/thread: {}", config.batch_size);
+    print_banner(&config);
 
     let started = Instant::now();
     let total_hashes = Arc::new(AtomicU64::new(0));
     let mut accepted = 0u64;
+    let mut stale = 0u64;
 
     while !stop.load(Ordering::Relaxed) {
         let template = match fetch_template(&client, &config) {
@@ -110,17 +121,24 @@ fn main() {
             }
         };
 
-        println!(
-            "[MINE] block #{} diff={} pending={} target={}",
-            template.header.number,
-            template.header.difficulty,
-            template.pending_tx_hashes.len(),
-            template.target
-        );
+        print_block_header(&template);
 
         let block_hashes_before = total_hashes.load(Ordering::Relaxed);
         let block_started = Instant::now();
-        let found = mine_template(&config, &template, target, &total_hashes, &stop);
+        let found = mine_template(
+            &config,
+            &template,
+            target,
+            &total_hashes,
+            &stop,
+            &MineView {
+                miner_started: started,
+                block_started,
+                block_hashes_before,
+                accepted,
+                stale,
+            },
+        );
         let block_hashes = total_hashes
             .load(Ordering::Relaxed)
             .saturating_sub(block_hashes_before);
@@ -131,12 +149,12 @@ fn main() {
         match found {
             Some(found) if !stop.load(Ordering::Relaxed) => {
                 println!(
-                    "[FOUND] block #{} nonce={} hash={} rate={} H/s avg={} H/s",
+                    "[FOUND] block #{} nonce={} hash={} rate={} avg={}",
                     template.header.number,
                     found.nonce,
                     found.block_hash,
-                    block_rate.round() as u64,
-                    avg_rate.round() as u64
+                    format_rate(block_rate),
+                    format_rate(avg_rate)
                 );
 
                 if config.no_submit {
@@ -149,6 +167,7 @@ fn main() {
                             println!("[SUBMIT] accepted={} response={}", accepted, body);
                         }
                         Err(SubmitError::Stale(body)) => {
+                            stale += 1;
                             println!("[STALE] node already advanced before submit: {body}");
                         }
                         Err(SubmitError::Failed(err)) => eprintln!("[WARN] submit failed: {err}"),
@@ -160,9 +179,14 @@ fn main() {
     }
 
     println!(
-        "[STOP] checked={} accepted={}",
-        total_hashes.load(Ordering::Relaxed),
-        accepted
+        "[STOP] checked={} accepted={} stale={} avg={}",
+        format_hashes(total_hashes.load(Ordering::Relaxed) as f64),
+        accepted,
+        stale,
+        format_rate(
+            total_hashes.load(Ordering::Relaxed) as f64
+                / started.elapsed().as_secs_f64().max(0.001)
+        )
     );
 }
 
@@ -252,6 +276,7 @@ fn mine_template(
     target: BigUint,
     total_hashes: &Arc<AtomicU64>,
     stop: &Arc<AtomicBool>,
+    view: &MineView,
 ) -> Option<Found> {
     let found_flag = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
@@ -266,6 +291,13 @@ fn mine_template(
         let found_flag = Arc::clone(&found_flag);
         let threads = config.threads as u64;
         let batch_size = config.batch_size;
+        let miner_started = view.miner_started;
+        let block_started = view.block_started;
+        let block_hashes_before = view.block_hashes_before;
+        let accepted = view.accepted;
+        let stale = view.stale;
+        let block_number = template.header.number;
+        let difficulty = template.header.difficulty.clone();
 
         handles.push(thread::spawn(move || {
             let mut rng = rand::thread_rng();
@@ -295,12 +327,25 @@ fn mine_template(
                 total_hashes.fetch_add(local_hashes, Ordering::Relaxed);
                 local_hashes = 0;
 
-                if worker_id == 0 && last_log.elapsed() >= Duration::from_secs(2) {
+                if worker_id == 0 && last_log.elapsed() >= STATUS_INTERVAL {
                     last_log = Instant::now();
+                    let checked = total_hashes.load(Ordering::Relaxed);
+                    let block_checked = checked.saturating_sub(block_hashes_before);
+                    let current_rate =
+                        block_checked as f64 / block_started.elapsed().as_secs_f64().max(0.001);
+                    let average_rate =
+                        checked as f64 / miner_started.elapsed().as_secs_f64().max(0.001);
                     println!(
-                        "[WORK] nonce~{} checked={}",
+                        "[STATS] block #{:<7} diff {:<9} speed {:>11} avg {:>11} total {:>10} acc {:<3} stale {:<3} uptime {} nonce~{}",
+                        block_number,
+                        difficulty,
+                        format_rate(current_rate),
+                        format_rate(average_rate),
+                        format_hashes(checked as f64),
+                        accepted,
+                        stale,
+                        format_duration(miner_started.elapsed()),
                         nonce,
-                        total_hashes.load(Ordering::Relaxed)
                     );
                 }
             }
@@ -391,4 +436,68 @@ fn sleep_or_stop(stop: &AtomicBool, duration: Duration) {
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn print_banner(config: &Config) {
+    println!("+------------------------------------------------------------+");
+    println!("| Ember CPU Miner                                            |");
+    println!("| Algo: Keccak-256 JSON PoW                                  |");
+    println!("| Threads: {:<49}|", config.threads);
+    println!("| Batch/thread: {:<44}|", config.batch_size);
+    println!("| Miner: {:<50}|", abbreviate(&config.miner, 12, 8));
+    println!("+------------------------------------------------------------+");
+}
+
+fn print_block_header(template: &Template) {
+    println!(
+        "[MINE] block #{} | diff {} | pending {} | parent {} | target {}",
+        template.header.number,
+        template.header.difficulty,
+        template.pending_tx_hashes.len(),
+        abbreviate(&template.header.parent_hash, 12, 8),
+        abbreviate(&template.target, 18, 8)
+    );
+}
+
+fn format_rate(rate: f64) -> String {
+    format!("{}H/s", format_scaled(rate))
+}
+
+fn format_hashes(hashes: f64) -> String {
+    format!("{}H", format_scaled(hashes))
+}
+
+fn format_scaled(value: f64) -> String {
+    const UNITS: [&str; 6] = ["", "K", "M", "G", "T", "P"];
+    let mut scaled = value.max(0.0);
+    let mut unit = 0usize;
+
+    while scaled >= 1000.0 && unit < UNITS.len() - 1 {
+        scaled /= 1000.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{:>6.0} {}", scaled, UNITS[unit])
+    } else if scaled >= 100.0 {
+        format!("{:>6.1} {}", scaled, UNITS[unit])
+    } else {
+        format!("{:>6.2} {}", scaled, UNITS[unit])
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn abbreviate(value: &str, head: usize, tail: usize) -> String {
+    if value.len() <= head + tail + 3 {
+        return value.to_string();
+    }
+
+    format!("{}...{}", &value[..head], &value[value.len() - tail..])
 }
