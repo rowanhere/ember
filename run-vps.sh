@@ -18,9 +18,18 @@ if [ "${1:-}" = "--cuda" ]; then
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "cargo not found. Install Rust first:"
-  echo '  curl https://sh.rustup.rs -sSf | sh'
-  echo '  source "$HOME/.cargo/env"'
+  echo "[RUN] cargo not found. Installing Rust with rustup..."
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "curl not found. Install it first, e.g. sudo apt install -y curl" >&2
+    exit 1
+  fi
+  curl https://sh.rustup.rs -sSf | sh -s -- -y
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo still not found after rustup install. Try: source \"$HOME/.cargo/env\"" >&2
   exit 1
 fi
 
