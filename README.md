@@ -45,6 +45,18 @@ Manual CUDA run:
 ./target/release/ember-cpu-miner --cuda --cuda-device 0 0xe0124ead86bdc20cc675317bef95533020a6165f
 ```
 
+Multiple GPUs:
+
+```bash
+CUDA_DEVICES=0,1 ./run-vps.sh --cuda
+```
+
+Manual multi-GPU run:
+
+```bash
+./target/release/ember-cpu-miner --cuda --cuda-devices 0,1 0xe0124ead86bdc20cc675317bef95533020a6165f
+```
+
 Options:
 
 ```bash

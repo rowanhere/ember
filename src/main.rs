@@ -70,7 +70,7 @@ struct Config {
     threads: usize,
     batch_size: u64,
     cuda: bool,
-    cuda_device: i32,
+    cuda_devices: Vec<i32>,
     cuda_batch_size: u64,
     no_submit: bool,
 }
@@ -159,7 +159,10 @@ fn main() {
     println!("[CONFIG] threads: {}", config.threads);
     println!("[CONFIG] batch size/thread: {}", config.batch_size);
     if config.cuda {
-        println!("[CONFIG] cuda device: {}", config.cuda_device);
+        println!(
+            "[CONFIG] cuda devices: {}",
+            format_cuda_devices(&config.cuda_devices)
+        );
         println!("[CONFIG] cuda batch size: {}", config.cuda_batch_size);
     }
     print_banner(&config);
@@ -297,7 +300,7 @@ fn parse_args() -> Config {
     let mut threads = num_cpus::get().max(1);
     let mut batch_size = DEFAULT_BATCH_SIZE;
     let mut cuda = false;
-    let mut cuda_device = 0i32;
+    let mut cuda_devices = vec![0i32];
     let mut cuda_batch_size = DEFAULT_CUDA_BATCH_SIZE;
     let mut no_submit = false;
 
@@ -322,7 +325,11 @@ fn parse_args() -> Config {
             "--cuda" => cuda = true,
             "--cuda-device" => {
                 let value = args.next().unwrap_or_else(|| usage());
-                cuda_device = value.parse::<i32>().unwrap_or_else(|_| usage());
+                cuda_devices = vec![value.parse::<i32>().unwrap_or_else(|_| usage())];
+            }
+            "--cuda-devices" => {
+                let value = args.next().unwrap_or_else(|| usage());
+                cuda_devices = parse_cuda_devices(&value).unwrap_or_else(|| usage());
             }
             "--cuda-batch-size" => {
                 let value = args.next().unwrap_or_else(|| usage());
@@ -351,7 +358,7 @@ fn parse_args() -> Config {
         threads,
         batch_size,
         cuda,
-        cuda_device,
+        cuda_devices,
         cuda_batch_size,
         no_submit,
     }
@@ -359,9 +366,31 @@ fn parse_args() -> Config {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: ember-cpu-miner [--cuda] [--cuda-device ID] [--cuda-batch-size N] [--node https://emberchain.org] [-j THREADS] [--batch-size N] [--no-submit] MINER_ADDRESS"
+        "Usage: ember-cpu-miner [--cuda] [--cuda-device ID|--cuda-devices 0,1] [--cuda-batch-size N] [--node https://emberchain.org] [-j THREADS] [--batch-size N] [--no-submit] MINER_ADDRESS"
     );
     std::process::exit(2);
+}
+
+fn parse_cuda_devices(value: &str) -> Option<Vec<i32>> {
+    let devices = value
+        .split(',')
+        .map(|part| part.trim().parse::<i32>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+
+    if devices.is_empty() {
+        None
+    } else {
+        Some(devices)
+    }
+}
+
+fn format_cuda_devices(devices: &[i32]) -> String {
+    devices
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn fetch_template(client: &Client, config: &Config) -> Result<Template, String> {
@@ -528,95 +557,142 @@ fn mine_template_cuda(
     view: &MineView,
 ) -> Option<Found> {
     let work_prefix = WorkPrefix::new(&template.header);
-    if let Err(err) = cuda_self_test(config, &work_prefix) {
-        eprintln!("[CUDA] self-test failed: {err}");
-        eprintln!("[CUDA] refusing to mine on GPU until the CUDA hash matches CPU/browser hash");
-        return None;
-    }
-
-    let mut rng = rand::thread_rng();
-    let mut start_nonce = rng.gen::<u64>();
-    let miner = abbreviate(&config.miner, 12, 8);
-    let node = config.node.clone();
-    let mut last_dashboard = Instant::now()
-        .checked_sub(STATUS_INTERVAL)
-        .unwrap_or_else(Instant::now);
-
-    while !stop.load(Ordering::Relaxed) {
-        let mut found_nonce = 0u64;
-        let mut found_hash = [0u8; 32];
-        let mut checked = 0u64;
-        let batch_started = Instant::now();
-
-        let status = unsafe {
-            ember_cuda_mine(
-                work_prefix.prefix.as_ptr(),
-                work_prefix.prefix.len(),
-                target.as_ptr(),
-                start_nonce,
-                config.cuda_batch_size,
-                &mut found_nonce,
-                found_hash.as_mut_ptr(),
-                &mut checked,
-                config.cuda_device,
-            )
-        };
-
-        if status < 0 {
-            eprintln!("[CUDA] kernel failed with status {status}");
-            sleep_or_stop(stop, Duration::from_secs(2));
+    for &device_id in &config.cuda_devices {
+        if let Err(err) = cuda_self_test(device_id, &work_prefix) {
+            eprintln!("[CUDA] self-test failed on device {device_id}: {err}");
+            eprintln!(
+                "[CUDA] refusing to mine on GPU until the CUDA hash matches CPU/browser hash"
+            );
             return None;
         }
-
-        total_hashes.fetch_add(checked, Ordering::Relaxed);
-
-        if last_dashboard.elapsed() >= STATUS_INTERVAL || status == 1 {
-            last_dashboard = Instant::now();
-            let all_checked = total_hashes.load(Ordering::Relaxed);
-            let block_checked = all_checked.saturating_sub(view.block_hashes_before);
-            let current_rate =
-                block_checked as f64 / view.block_started.elapsed().as_secs_f64().max(0.001);
-            let average_rate =
-                all_checked as f64 / view.miner_started.elapsed().as_secs_f64().max(0.001);
-            render_dashboard(&Dashboard {
-                miner: &miner,
-                node: &node,
-                threads: 1,
-                block: template.header.number,
-                difficulty: &template.header.difficulty,
-                current_rate,
-                average_rate,
-                checked: all_checked,
-                uptime: view.miner_started.elapsed(),
-                current_nonce: start_nonce,
-                blocks_found: view.blocks_found,
-                accepted: view.accepted,
-                stale: view.stale,
-                recent_blocks: &view.recent_blocks,
-            });
-        }
-
-        if status == 1 {
-            return Some(Found {
-                nonce: found_nonce,
-                block_hash: format_hash_hex(&found_hash),
-            });
-        }
-
-        let elapsed = batch_started.elapsed().as_secs_f64().max(0.001);
-        let rate = checked as f64 / elapsed;
-        if rate < 1_000.0 {
-            eprintln!("[CUDA] very low GPU rate detected: {}", format_rate(rate));
-        }
-
-        start_nonce = start_nonce.wrapping_add(checked);
     }
 
-    None
+    let found_flag = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let mut handles = Vec::with_capacity(config.cuda_devices.len());
+    let mut rng = rand::thread_rng();
+    let base_nonce = rng.gen::<u64>();
+    let device_count = config.cuda_devices.len() as u64;
+
+    for (device_index, &device_id) in config.cuda_devices.iter().enumerate() {
+        let work_prefix = work_prefix.clone();
+        let tx = tx.clone();
+        let stop = Arc::clone(stop);
+        let found_flag = Arc::clone(&found_flag);
+        let total_hashes = Arc::clone(total_hashes);
+        let target = target;
+        let cuda_batch_size = config.cuda_batch_size;
+        let miner = abbreviate(&config.miner, 12, 8);
+        let node = config.node.clone();
+        let miner_started = view.miner_started;
+        let block_started = view.block_started;
+        let block_hashes_before = view.block_hashes_before;
+        let blocks_found = view.blocks_found;
+        let accepted = view.accepted;
+        let stale = view.stale;
+        let recent_blocks = view.recent_blocks.clone();
+        let block_number = template.header.number;
+        let difficulty = template.header.difficulty.clone();
+        let dashboard_devices = config.cuda_devices.len();
+        let mut start_nonce =
+            base_nonce.wrapping_add((device_index as u64).wrapping_mul(cuda_batch_size));
+
+        handles.push(thread::spawn(move || {
+            let mut last_dashboard = Instant::now()
+                .checked_sub(STATUS_INTERVAL)
+                .unwrap_or_else(Instant::now);
+
+            while !stop.load(Ordering::Relaxed) && !found_flag.load(Ordering::Relaxed) {
+                let mut found_nonce = 0u64;
+                let mut found_hash = [0u8; 32];
+                let mut checked = 0u64;
+                let batch_started = Instant::now();
+
+                let status = unsafe {
+                    ember_cuda_mine(
+                        work_prefix.prefix.as_ptr(),
+                        work_prefix.prefix.len(),
+                        target.as_ptr(),
+                        start_nonce,
+                        cuda_batch_size,
+                        &mut found_nonce,
+                        found_hash.as_mut_ptr(),
+                        &mut checked,
+                        device_id,
+                    )
+                };
+
+                if status < 0 {
+                    eprintln!("[CUDA] device {device_id} kernel failed with status {status}");
+                    return;
+                }
+
+                total_hashes.fetch_add(checked, Ordering::Relaxed);
+
+                if device_index == 0 && (last_dashboard.elapsed() >= STATUS_INTERVAL || status == 1)
+                {
+                    last_dashboard = Instant::now();
+                    let all_checked = total_hashes.load(Ordering::Relaxed);
+                    let block_checked = all_checked.saturating_sub(block_hashes_before);
+                    let current_rate =
+                        block_checked as f64 / block_started.elapsed().as_secs_f64().max(0.001);
+                    let average_rate =
+                        all_checked as f64 / miner_started.elapsed().as_secs_f64().max(0.001);
+                    render_dashboard(&Dashboard {
+                        miner: &miner,
+                        node: &node,
+                        threads: dashboard_devices,
+                        block: block_number,
+                        difficulty: &difficulty,
+                        current_rate,
+                        average_rate,
+                        checked: all_checked,
+                        uptime: miner_started.elapsed(),
+                        current_nonce: start_nonce,
+                        blocks_found,
+                        accepted,
+                        stale,
+                        recent_blocks: &recent_blocks,
+                    });
+                }
+
+                if status == 1 {
+                    if !found_flag.swap(true, Ordering::Relaxed) {
+                        let _ = tx.send(Found {
+                            nonce: found_nonce,
+                            block_hash: format_hash_hex(&found_hash),
+                        });
+                    }
+                    return;
+                }
+
+                let elapsed = batch_started.elapsed().as_secs_f64().max(0.001);
+                let rate = checked as f64 / elapsed;
+                if rate < 1_000.0 {
+                    eprintln!(
+                        "[CUDA] device {device_id} very low GPU rate detected: {}",
+                        format_rate(rate)
+                    );
+                }
+
+                start_nonce = start_nonce.wrapping_add(cuda_batch_size.wrapping_mul(device_count));
+            }
+        }));
+    }
+
+    drop(tx);
+    let found = rx.recv().ok();
+    found_flag.store(true, Ordering::Relaxed);
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    found
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_self_test(config: &Config, work_prefix: &WorkPrefix) -> Result<(), String> {
+fn cuda_self_test(device_id: i32, work_prefix: &WorkPrefix) -> Result<(), String> {
     let test_nonce = 123_456_789u64;
     let pass_target = [0xffu8; 32];
     let expected_hash = block_hash_bytes(work_prefix, test_nonce);
@@ -634,7 +710,7 @@ fn cuda_self_test(config: &Config, work_prefix: &WorkPrefix) -> Result<(), Strin
             &mut found_nonce,
             found_hash.as_mut_ptr(),
             &mut checked,
-            config.cuda_device,
+            device_id,
         )
     };
 

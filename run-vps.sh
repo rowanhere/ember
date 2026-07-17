@@ -7,6 +7,7 @@ THREADS="${THREADS:-$(nproc)}"
 BATCH_SIZE="${BATCH_SIZE:-25000}"
 CUDA="${CUDA:-0}"
 CUDA_DEVICE="${CUDA_DEVICE:-0}"
+CUDA_DEVICES="${CUDA_DEVICES:-$CUDA_DEVICE}"
 CUDA_BATCH_SIZE="${CUDA_BATCH_SIZE:-67108864}"
 CUDA_ARCH="${CUDA_ARCH:-sm_89}"
 export CUDA_ARCH
@@ -32,7 +33,7 @@ if [ "$CUDA" = "1" ]; then
   cargo build --release --features cuda
   exec ./target/release/ember-cpu-miner \
     --cuda \
-    --cuda-device "$CUDA_DEVICE" \
+    --cuda-devices "$CUDA_DEVICES" \
     --cuda-batch-size "$CUDA_BATCH_SIZE" \
     --node "$NODE" \
     "$MINER"
