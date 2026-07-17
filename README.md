@@ -39,6 +39,8 @@ Run on an RTX 4090:
 ./run-vps.sh --cuda
 ```
 
+`run-vps.sh` pulls latest code before building and auto-uses every GPU reported by `nvidia-smi`.
+
 Manual CUDA run:
 
 ```bash
@@ -46,6 +48,12 @@ Manual CUDA run:
 ```
 
 Multiple GPUs:
+
+```bash
+./run-vps.sh --cuda
+```
+
+Override GPU selection:
 
 ```bash
 CUDA_DEVICES=0,1 ./run-vps.sh --cuda

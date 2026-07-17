@@ -7,9 +7,10 @@ THREADS="${THREADS:-$(nproc)}"
 BATCH_SIZE="${BATCH_SIZE:-25000}"
 CUDA="${CUDA:-0}"
 CUDA_DEVICE="${CUDA_DEVICE:-0}"
-CUDA_DEVICES="${CUDA_DEVICES:-$CUDA_DEVICE}"
+CUDA_DEVICES="${CUDA_DEVICES:-}"
 CUDA_BATCH_SIZE="${CUDA_BATCH_SIZE:-67108864}"
 CUDA_ARCH="${CUDA_ARCH:-sm_89}"
+AUTO_PULL="${AUTO_PULL:-1}"
 export CUDA_ARCH
 
 if [ "${1:-}" = "--cuda" ]; then
@@ -24,12 +25,25 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+if [ "$AUTO_PULL" = "1" ] && [ -d .git ] && command -v git >/dev/null 2>&1; then
+  echo "[RUN] Pulling latest code..."
+  git pull --ff-only
+fi
+
 if [ "$CUDA" = "1" ]; then
   if ! command -v nvcc >/dev/null 2>&1; then
     echo "nvcc not found. Install the CUDA toolkit first." >&2
     exit 1
   fi
 
+  if [ -z "$CUDA_DEVICES" ]; then
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      CUDA_DEVICES="$(nvidia-smi --query-gpu=index --format=csv,noheader | tr -d ' ' | paste -sd, -)"
+    fi
+    CUDA_DEVICES="${CUDA_DEVICES:-$CUDA_DEVICE}"
+  fi
+
+  echo "[RUN] CUDA devices: $CUDA_DEVICES"
   cargo build --release --features cuda
   exec ./target/release/ember-cpu-miner \
     --cuda \
