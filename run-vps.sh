@@ -9,9 +9,8 @@ CUDA="${CUDA:-0}"
 CUDA_DEVICE="${CUDA_DEVICE:-0}"
 CUDA_DEVICES="${CUDA_DEVICES:-}"
 CUDA_BATCH_SIZE="${CUDA_BATCH_SIZE:-67108864}"
-CUDA_ARCH="${CUDA_ARCH:-sm_89}"
+CUDA_ARCH="${CUDA_ARCH:-}"
 AUTO_PULL="${AUTO_PULL:-1}"
-export CUDA_ARCH
 
 if [ "${1:-}" = "--cuda" ]; then
   CUDA=1
@@ -43,7 +42,19 @@ if [ "$CUDA" = "1" ]; then
     CUDA_DEVICES="${CUDA_DEVICES:-$CUDA_DEVICE}"
   fi
 
+  if [ -z "$CUDA_ARCH" ]; then
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      CUDA_COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d ' .')"
+      if [ -n "$CUDA_COMPUTE_CAP" ]; then
+        CUDA_ARCH="sm_${CUDA_COMPUTE_CAP}"
+      fi
+    fi
+    CUDA_ARCH="${CUDA_ARCH:-sm_89}"
+  fi
+  export CUDA_ARCH
+
   echo "[RUN] CUDA devices: $CUDA_DEVICES"
+  echo "[RUN] CUDA arch: $CUDA_ARCH"
   cargo build --release --features cuda
   exec ./target/release/ember-cpu-miner \
     --cuda \

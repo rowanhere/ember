@@ -39,7 +39,7 @@ Run on an RTX 4090:
 ./run-vps.sh --cuda
 ```
 
-`run-vps.sh` pulls latest code before building and auto-uses every GPU reported by `nvidia-smi`.
+`run-vps.sh` pulls latest code before building, auto-uses every GPU reported by `nvidia-smi`, and auto-detects `CUDA_ARCH` from GPU compute capability.
 
 Manual CUDA run:
 
